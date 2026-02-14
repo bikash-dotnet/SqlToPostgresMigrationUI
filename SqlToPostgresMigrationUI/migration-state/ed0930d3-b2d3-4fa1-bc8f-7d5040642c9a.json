@@ -1,0 +1,15 @@
+{
+  "StartTime": "2026-02-14T20:30:22.0218347Z",
+  "EndTime": "2026-02-14T20:30:22.1993842Z",
+  "Status": "Failed",
+  "ErrorMessage": "A connection was successfully established with the server, but then an error occurred during the login process. (provider: SSL Provider, error: 0 - The certificate chain was issued by an authority that is not trusted.)",
+  "SourceTables": 0,
+  "SourceRowCount": 0,
+  "TablesCreated": 0,
+  "ForeignKeysCreated": 0,
+  "TablesValidated": 0,
+  "TablesFailedValidation": 0,
+  "Validations": [],
+  "Metadata": {},
+  "Duration": "00:00:00.1775495"
+}

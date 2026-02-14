@@ -1,0 +1,272 @@
+﻿@* Components/ProgressChart.razor *@
+@using SqlToPostgresMigrationUI.Services.DTOs
+@using Microsoft.JSInterop
+
+@inject IJSRuntime JS
+@implements IDisposable
+
+<div class="progress-chart-container">
+    @if (TableProgress?.Any() == true)
+    {
+        <div class="row">
+            <div class="col-md-8">
+                <div class="card">
+                    <div class="card-header">
+                        <h6>Migration Speed (Rows/Second)</h6>
+                    </div>
+                    <div class="card-body">
+                        <canvas id="@ChartId" @ref="_chartElement"></canvas>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-4">
+                <div class="card">
+                    <div class="card-header">
+                        <h6>Overall Progress</h6>
+                    </div>
+                    <div class="card-body">
+                        <div class="text-center mb-3">
+                            <h2>@OverallPercentage.ToString("F1")%</h2>
+                            <div class="progress" style="height: 30px;">
+                                <div class="progress-bar bg-success progress-bar-striped progress-bar-animated"
+                                     role="progressbar"
+                                     style="width: @OverallPercentage%">
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="stats-container">
+                            <div class="stat-item">
+                                <span class="stat-label">Processed:</span>
+                                <span class="stat-value">@TotalProcessedRows.ToString("N0")</span>
+                            </div>
+                            <div class="stat-item">
+                                <span class="stat-label">Total:</span>
+                                <span class="stat-value">@TotalRows.ToString("N0")</span>
+                            </div>
+                            <div class="stat-item">
+                                <span class="stat-label">Tables:</span>
+                                <span class="stat-value">@CompletedTables / @TotalTables</span>
+                            </div>
+                            <div class="stat-item">
+                                <span class="stat-label">Speed:</span>
+                                <span class="stat-value">@CurrentSpeed.ToString("N0") rows/s</span>
+                            </div>
+                            <div class="stat-item">
+                                <span class="stat-label">ETA:</span>
+                                <span class="stat-value">@EstimatedTimeRemaining</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="row mt-3">
+            <div class="col-12">
+                <div class="card">
+                    <div class="card-header">
+                        <h6>Table Progress Breakdown</h6>
+                    </div>
+                    <div class="card-body">
+                        @foreach (var table in TableProgress.OrderBy(t => t.TableName))
+                        {
+                            <div class="table-progress-item mb-2">
+                                <div class="d-flex justify-content-between">
+                                    <span>@table.TableName</span>
+                                    <span>@table.RowsProcessed.ToString("N0") / @table.TotalRows.ToString("N0")</span>
+                                </div>
+                                <div class="progress" style="height: 20px;">
+                                    <div class="progress-bar @GetProgressBarClass(table.Status)"
+                                         role="progressbar"
+                                         style="width: @table.Percentage%"
+                                         title="@table.Status">
+                                        @table.Percentage.ToString("F1")%
+                                    </div>
+                                </div>
+                                <small class="text-muted">Status: @table.Status</small>
+                            </div>
+                        }
+                    </div>
+                </div>
+            </div>
+        </div>
+    }
+    else
+    {
+        <div class="alert alert-info">
+            No migration progress data available. Start a migration to see charts.
+        </div>
+    }
+</div>
+
+@code {
+    [Parameter] public List<TableProgressDto> TableProgress { get; set; } = new();
+    [Parameter] public string ChartId { get; set; } = $"chart-{Guid.NewGuid():N}";
+
+    private ElementReference _chartElement;
+    private IJSObjectReference? _chartModule;
+    private Timer? _updateTimer;
+    private readonly Queue<SpeedSample> _speedSamples = new();
+    private long _lastProcessedTotal;
+    private DateTime _lastSampleTime = DateTime.UtcNow;
+
+    // Computed properties
+    private long TotalProcessedRows => TableProgress.Sum(t => t.RowsProcessed);
+    private long TotalRows => TableProgress.Sum(t => t.TotalRows);
+    private int TotalTables => TableProgress.Count;
+    private int CompletedTables => TableProgress.Count(t => t.Status == "Completed");
+    private double OverallPercentage => TotalRows > 0
+        ? Math.Round(TotalProcessedRows * 100.0 / TotalRows, 1)
+        : 0;
+
+    private double CurrentSpeed
+    {
+        get
+        {
+            if (_speedSamples.Count < 2) return 0;
+            return _speedSamples.Average(s => s.RowsPerSecond);
+        }
+    }
+
+    private string EstimatedTimeRemaining
+    {
+        get
+        {
+            if (CurrentSpeed <= 0 || TotalProcessedRows >= TotalRows)
+                return "Calculating...";
+
+            var remainingRows = TotalRows - TotalProcessedRows;
+            var secondsRemaining = remainingRows / CurrentSpeed;
+
+            if (secondsRemaining < 60)
+                return $"{Math.Ceiling(secondsRemaining)} seconds";
+            if (secondsRemaining < 3600)
+                return $"{Math.Ceiling(secondsRemaining / 60)} minutes";
+
+            var hours = Math.Floor(secondsRemaining / 3600);
+            var minutes = Math.Ceiling((secondsRemaining % 3600) / 60);
+            return $"{hours}h {minutes}m";
+        }
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (firstRender)
+        {
+            _chartModule = await JS.InvokeAsync<IJSObjectReference>(
+                "import",
+                "./js/chart-utils.js");
+
+            await InitializeChart();
+
+            // Update chart every 2 seconds
+            _updateTimer = new Timer(async _ =>
+            {
+                await UpdateChart();
+                UpdateSpeedMetrics();
+                await InvokeAsync(StateHasChanged);
+            }, null, TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(2));
+        }
+    }
+
+    private async Task InitializeChart()
+    {
+        if (_chartModule != null && TableProgress.Any())
+        {
+            var chartData = PrepareChartData();
+            await _chartModule.InvokeVoidAsync("createProgressChart",
+                _chartElement,
+                chartData.labels,
+                chartData.datasets);
+        }
+    }
+
+    private async Task UpdateChart()
+    {
+        if (_chartModule != null && TableProgress.Any())
+        {
+            var chartData = PrepareChartData();
+            await _chartModule.InvokeVoidAsync("updateProgressChart",
+                _chartElement,
+                chartData.datasets);
+        }
+    }
+
+    private (string[] labels, object[] datasets) PrepareChartData()
+    {
+        var labels = new[] { "Last 30 seconds" };
+
+        var datasets = TableProgress
+            .Where(t => t.TotalRows > 0)
+            .Select(t => new
+            {
+                label = t.TableName,
+                data = new[] { t.Percentage },
+                backgroundColor = GetRandomColor(t.TableName),
+                borderColor = "rgba(255, 255, 255, 0.8)",
+                borderWidth = 1
+            })
+            .Cast<object>()
+            .ToArray();
+
+        return (labels, datasets);
+    }
+
+    private void UpdateSpeedMetrics()
+    {
+        var currentTotal = TotalProcessedRows;
+        var now = DateTime.UtcNow;
+        var timeDiff = (now - _lastSampleTime).TotalSeconds;
+
+        if (timeDiff >= 1)
+        {
+            var rowsPerSecond = (currentTotal - _lastProcessedTotal) / timeDiff;
+
+            _speedSamples.Enqueue(new SpeedSample
+            {
+                RowsPerSecond = rowsPerSecond,
+                Timestamp = now
+            });
+
+            // Keep last 10 samples
+            while (_speedSamples.Count > 10)
+            {
+                _speedSamples.Dequeue();
+            }
+
+            _lastProcessedTotal = currentTotal;
+            _lastSampleTime = now;
+        }
+    }
+
+    private string GetProgressBarClass(string status) => status switch
+    {
+        "Completed" => "bg-success",
+        "Failed" => "bg-danger",
+        "Starting" => "bg-info",
+        var s when s.StartsWith("Retry") => "bg-warning",
+        _ => "bg-primary"
+    };
+
+    private string GetRandomColor(string seed)
+    {
+        var hash = seed.GetHashCode();
+        var r = (byte)((hash & 0xFF0000) >> 16);
+        var g = (byte)((hash & 0x00FF00) >> 8);
+        var b = (byte)(hash & 0x0000FF);
+
+        return $"rgba({r}, {g}, {b}, 0.7)";
+    }
+
+    public void Dispose()
+    {
+        _updateTimer?.Dispose();
+    }
+
+    private class SpeedSample
+    {
+        public double RowsPerSecond { get; set; }
+        public DateTime Timestamp { get; set; }
+    }
+}

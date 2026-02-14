@@ -1,0 +1,15 @@
+{
+  "StartTime": "2026-02-14T19:57:22.496397Z",
+  "EndTime": "2026-02-14T19:57:22.7085359Z",
+  "Status": "Failed",
+  "ErrorMessage": "The ConnectionString property has not been initialized.",
+  "SourceTables": 0,
+  "SourceRowCount": 0,
+  "TablesCreated": 0,
+  "ForeignKeysCreated": 0,
+  "TablesValidated": 0,
+  "TablesFailedValidation": 0,
+  "Validations": [],
+  "Metadata": {},
+  "Duration": "00:00:00.2121389"
+}

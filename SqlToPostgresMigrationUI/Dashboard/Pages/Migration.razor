@@ -1,0 +1,935 @@
+﻿@* Dashboard/Pages/Migration.razor *@
+@page "/"
+@page "/migration"
+@page "/migration/{MigrationId}"
+@using SqlToPostgresMigrationUI.Core.Models
+@using SqlToPostgresMigrationUI.Dashboard.Components
+@using SqlToPostgresMigrationUI.Services
+@using SqlToPostgresMigrationUI.Services.DTOs
+@using SqlToPostgresMigrationUI.Services.SignalR
+@using SqlToPostgresMigrationUI.Core.Orchestrator
+@using Microsoft.AspNetCore.SignalR.Client
+@using System.Text.Json
+@implements IAsyncDisposable
+@inject IMigrationService MigrationService
+@inject MigrationStateService StateService
+@inject NavigationManager Navigation
+@inject ILogger<Migration> Logger
+@inject IConfiguration Configuration
+
+<PageTitle>SQL Server to PostgreSQL Migration</PageTitle>
+
+<div class="container-fluid migration-dashboard">
+    <!-- Header -->
+    <div class="row">
+        <div class="col-12">
+            <div class="page-header d-flex justify-content-between align-items-center">
+                <h1>
+                    <i class="oi oi-data-transfer-download"></i> 
+                    Database Migration Tool
+                </h1>
+                <div>
+                    @if (!string.IsNullOrEmpty(MigrationId))
+                    {
+                        <span class="badge bg-info me-2">Migration ID: @MigrationId</span>
+                    }
+                    <button class="btn btn-sm btn-outline-secondary" @onclick="RefreshData">
+                        <i class="oi oi-reload"></i> Refresh
+                    </button>
+                </div>
+            </div>
+            <hr />
+        </div>
+    </div>
+
+    <!-- Main Content -->
+    <div class="row">
+        <!-- Configuration Panel -->
+        <div class="col-md-4">
+            <div class="card configuration-card">
+                <div class="card-header bg-primary text-white">
+                    <h5 class="mb-0">
+                        <i class="oi oi-wrench"></i> 
+                        Migration Configuration
+                    </h5>
+                </div>
+                <div class="card-body">
+                    <EditForm Model="@request" OnValidSubmit="@StartMigration">
+                        <DataAnnotationsValidator />
+                        <ValidationSummary class="text-danger" />
+
+                        <!-- Source Connection -->
+                        <div class="form-group mb-3">
+                            <label class="form-label fw-bold">
+                                <i class="oi oi-database"></i> SQL Server Connection
+                            </label>
+                            <input type="text" class="form-control" @bind="request.SourceConnection" 
+                                   placeholder="Server=localhost;Database=SourceDB;Trusted_Connection=True;MultipleActiveResultSets=true;" />
+                            <small class="text-muted">Source database connection string</small>
+                        </div>
+
+                        <!-- Target Connection -->
+                        <div class="form-group mb-3">
+                            <label class="form-label fw-bold">
+                                <i class="oi oi-database"></i> PostgreSQL Connection
+                            </label>
+                            <input type="text" class="form-control" @bind="request.TargetConnection" 
+                                   placeholder="Host=localhost;Database=TargetDB;Username=postgres;Password=;" />
+                            <small class="text-muted">Target database connection string</small>
+                        </div>
+
+                        <!-- Advanced Options -->
+                        <div class="accordion mb-3" id="advancedOptions">
+                            <div class="accordion-item">
+                                <h2 class="accordion-header">
+                                    <button class="accordion-button collapsed" type="button" 
+                                            data-bs-toggle="collapse" data-bs-target="#collapseAdvanced">
+                                        <i class="oi oi-settings"></i> Advanced Options
+                                    </button>
+                                </h2>
+                                <div id="collapseAdvanced" class="accordion-collapse collapse">
+                                    <div class="accordion-body">
+                                        <!-- Dry Run -->
+                                        <div class="form-check mb-3">
+                                            <input type="checkbox" class="form-check-input" 
+                                                   @bind="request.DryRun" id="dryRun" />
+                                            <label class="form-check-label" for="dryRun">
+                                                Dry Run (Schema only, no data)
+                                            </label>
+                                        </div>
+
+                                        <!-- Parallel Tables -->
+                                        <div class="form-group mb-3">
+                                            <label class="form-label">Parallel Tables</label>
+                                            <input type="number" class="form-control" 
+                                                   @bind="request.MaxParallelTables" min="1" max="10" />
+                                            <small class="text-muted">Number of tables to migrate simultaneously</small>
+                                        </div>
+
+                                        <!-- Batch Size -->
+                                        <div class="form-group mb-3">
+                                            <label class="form-label">Batch Size</label>
+                                            <input type="number" class="form-control" 
+                                                   @bind="request.BatchSize" min="1000" max="100000" step="1000" />
+                                            <small class="text-muted">Rows per batch for bulk transfer</small>
+                                        </div>
+
+                                        <!-- Retry Settings -->
+                                        <div class="form-group mb-3">
+                                            <label class="form-label">Max Retries</label>
+                                            <input type="number" class="form-control" 
+                                                   @bind="request.MaxRetries" min="0" max="10" />
+                                        </div>
+
+                                        <div class="form-group mb-3">
+                                            <label class="form-label">Retry Delay (seconds)</label>
+                                            <input type="number" class="form-control" 
+                                                   @bind="request.RetryDelaySeconds" min="1" max="60" />
+                                        </div>
+
+                                        <!-- Validation -->
+                                        <div class="form-check mb-3">
+                                            <input type="checkbox" class="form-check-input" 
+                                                   @bind="request.ValidateData" id="validateData" />
+                                            <label class="form-check-label" for="validateData">
+                                                Validate Data After Migration
+                                            </label>
+                                        </div>
+
+                                        <!-- Table Filters -->
+                                        <div class="form-group mb-3">
+                                            <label class="form-label">Include Tables (optional)</label>
+                                            <input type="text" class="form-control" 
+                                                   @bind="includeTablesText" 
+                                                   placeholder="table1,table2,table3" />
+                                            <small class="text-muted">Comma-separated list of tables to include</small>
+                                        </div>
+
+                                        <div class="form-group mb-3">
+                                            <label class="form-label">Exclude Tables (optional)</label>
+                                            <input type="text" class="form-control" 
+                                                   @bind="excludeTablesText" 
+                                                   placeholder="table4,table5" />
+                                            <small class="text-muted">Comma-separated list of tables to exclude</small>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Action Buttons -->
+                        <div class="d-grid gap-2">
+                            <button type="submit" class="btn btn-primary btn-lg" 
+                                    disabled="@IsRunning">
+                                @if (IsRunning)
+                                {
+                                    <span class="spinner-border spinner-border-sm me-2" role="status"></span>
+                                    <span>Migration in Progress...</span>
+                                }
+                                else if (request.DryRun)
+                                {
+                                    <span><i class="oi oi-eye"></i> Start Dry Run</span>
+                                }
+                                else
+                                {
+                                    <span><i class="oi oi-play-circle"></i> Start Migration</span>
+                                }
+                            </button>
+
+                            @if (IsRunning)
+                            {
+                                <button class="btn btn-warning" @onclick="CancelCurrentMigration">
+                                    <i class="oi oi-circle-x"></i> Cancel Migration
+                                </button>
+                            }
+
+                            @if (!string.IsNullOrEmpty(StateFilePath) && File.Exists(StateFilePath))
+                            {
+                                <button class="btn btn-secondary" @onclick="LoadLastState">
+                                    <i class="oi oi-folder"></i> Load Last State
+                                </button>
+                            }
+                        </div>
+                    </EditForm>
+                </div>
+            </div>
+
+            <!-- Quick Stats Card -->
+            @if (Report != null)
+            {
+                <div class="card mt-3">
+                    <div class="card-header bg-info text-white">
+                        <h6 class="mb-0"><i class="oi oi-graph"></i> Quick Stats</h6>
+                    </div>
+                    <div class="card-body">
+                        <div class="row g-2">
+                            <div class="col-6">
+                                <div class="stat-box">
+                                    <small>Tables</small>
+                                    <h4>@Report.SourceTables</h4>
+                                </div>
+                            </div>
+                            <div class="col-6">
+                                <div class="stat-box">
+                                    <small>Total Rows</small>
+                                    <h4>@Report.SourceRowCount.ToString("N0")</h4>
+                                </div>
+                            </div>
+                            <div class="col-6">
+                                <div class="stat-box">
+                                    <small>Created</small>
+                                    <h4>@Report.TablesCreated</h4>
+                                </div>
+                            </div>
+                            <div class="col-6">
+                                <div class="stat-box">
+                                    <small>Foreign Keys</small>
+                                    <h4>@Report.ForeignKeysCreated</h4>
+                                </div>
+                            </div>
+                            <div class="col-12">
+                                <div class="stat-box">
+                                    <small>Duration</small>
+                                    <h4>@Report.Duration.ToString(@"hh\:mm\:ss")</h4>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            }
+        </div>
+
+        <!-- Progress Panel -->
+        <div class="col-md-8">
+            <div class="card">
+                <div class="card-header bg-success text-white d-flex justify-content-between align-items-center">
+                    <h5 class="mb-0"><i class="oi oi-task"></i> Migration Progress</h5>
+                    <span class="badge bg-light text-dark" id="connectionStatus">
+                        @(_isConnected ? "🟢 Connected" : "🔴 Disconnected")
+                    </span>
+                </div>
+                <div class="card-body">
+                    @if (Report != null || TableProgress.Any())
+                    {
+                        <!-- Overall Progress Bar -->
+                        <div class="overall-progress mb-4">
+                            <div class="d-flex justify-content-between mb-1">
+                                <span>Overall Progress</span>
+                                <span class="fw-bold">@GetOverallProgress().ToString("F1")%</span>
+                            </div>
+                            <div class="progress" style="height: 30px;">
+                                <div class="progress-bar progress-bar-striped progress-bar-animated 
+                                            @GetOverallProgressClass()" 
+                                     role="progressbar" 
+                                     style="width: @GetOverallProgress()%">
+                                    @GetOverallProgress().ToString("F1")%
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Stats Cards -->
+                        <div class="row mb-4">
+                            <div class="col-md-3 col-6">
+                                <div class="stats-card bg-primary text-white">
+                                    <div class="stats-icon">
+                                        <i class="oi oi-list-rich"></i>
+                                    </div>
+                                    <div class="stats-details">
+                                        <div class="stats-number">@TableProgress.Count</div>
+                                        <div class="stats-label">Tables</div>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="col-md-3 col-6">
+                                <div class="stats-card bg-success text-white">
+                                    <div class="stats-icon">
+                                        <i class="oi oi-check"></i>
+                                    </div>
+                                    <div class="stats-details">
+                                        <div class="stats-number">@CompletedTables</div>
+                                        <div class="stats-label">Completed</div>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="col-md-3 col-6">
+                                <div class="stats-card bg-info text-white">
+                                    <div class="stats-icon">
+                                        <i class="oi oi-data-transfer-upload"></i>
+                                    </div>
+                                    <div class="stats-details">
+                                        <div class="stats-number">@TotalProcessedRows.ToString("N0")</div>
+                                        <div class="stats-label">Rows</div>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="col-md-3 col-6">
+                                <div class="stats-card @(CurrentSpeed > 0 ? "bg-warning" : "bg-secondary") text-white">
+                                    <div class="stats-icon">
+                                        <i class="oi oi-speedometer"></i>
+                                    </div>
+                                    <div class="stats-details">
+                                        <div class="stats-number">@CurrentSpeed.ToString("N0")</div>
+                                        <div class="stats-label">Rows/sec</div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Progress Chart Component -->
+                        <ProgressChart TableProgress="@TableProgress" ChartId="mainProgressChart" />
+
+                        <!-- Table Progress List -->
+                        <div class="table-progress-section mt-4">
+                            <h6>
+                                <i class="oi oi-list"></i> 
+                                Table Migration Status
+                                <span class="badge bg-secondary ms-2">@TableProgress.Count tables</span>
+                            </h6>
+                            
+                            @if (TableProgress.Any())
+                            {
+                                <div class="table-responsive" style="max-height: 400px; overflow-y: auto;">
+                                    <table class="table table-sm table-hover">
+                                        <thead class="sticky-top bg-light">
+                                            <tr>
+                                                <th>Table Name</th>
+                                                <th>Status</th>
+                                                <th>Progress</th>
+                                                <th class="text-end">Rows</th>
+                                                <th class="text-center">ETA</th>
+                                                <th></th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            @foreach (var progress in TableProgress.OrderBy(p => p.TableName))
+                                            {
+                                                <tr>
+                                                    <td>
+                                                        <strong>@progress.TableName</strong>
+                                                    </td>
+                                                    <td>
+                                                        <span class="badge @GetStatusBadgeClass(progress.Status)">
+                                                            @progress.Status
+                                                        </span>
+                                                    </td>
+                                                    <td style="min-width: 200px;">
+                                                        <div class="progress" style="height: 20px;">
+                                                            <div class="progress-bar @GetProgressBarClass(progress.Status)" 
+                                                                 role="progressbar" 
+                                                                 style="width: @progress.Percentage%"
+                                                                 title="@progress.RowsProcessed.ToString("N0") of @progress.TotalRows.ToString("N0") rows">
+                                                                @progress.Percentage.ToString("F0")%
+                                                            </div>
+                                                        </div>
+                                                    </td>
+                                                    <td class="text-end">
+                                                        @progress.RowsProcessed.ToString("N0") / 
+                                                        @progress.TotalRows.ToString("N0")
+                                                    </td>
+                                                    <td class="text-center">
+                                                        @CalculateTableETA(progress)
+                                                    </td>
+                                                    <td>
+                                                        @if (progress.Status == "Failed")
+                                                        {
+                                                            <button class="btn btn-sm btn-outline-danger" 
+                                                                    @onclick="() => ShowError(progress)">
+                                                                <i class="oi oi-warning"></i>
+                                                            </button>
+                                                        }
+                                                    </td>
+                                                </tr>
+                                            }
+                                        </tbody>
+                                    </table>
+                                </div>
+                            }
+                            else
+                            {
+                                <div class="alert alert-info">
+                                    <i class="oi oi-info"></i>
+                                    No tables are being migrated yet. Start a migration to see progress.
+                                </div>
+                            }
+                        </div>
+
+                        <!-- Real-time Log -->
+                        <div class="migration-log mt-4">
+                            <h6>
+                                <i class="oi oi-terminal"></i> 
+                                Migration Log
+                                <button class="btn btn-sm btn-outline-secondary float-end" @onclick="ClearLog">
+                                    <i class="oi oi-trash"></i> Clear
+                                </button>
+                            </h6>
+                            <div class="log-container" @ref="logContainer">
+                                @foreach (var log in _logs)
+                                {
+                                    <div class="log-entry log-@log.Level">
+                                        <span class="log-time">[@log.Timestamp.ToString("HH:mm:ss")]</span>
+                                        <span class="log-message">@log.Message</span>
+                                    </div>
+                                }
+                            </div>
+                        </div>
+                    }
+                    else
+                    {
+                        <div class="text-center py-5">
+                            <i class="oi oi-database" style="font-size: 4rem; opacity: 0.3;"></i>
+                            <h4 class="mt-3">No Active Migration</h4>
+                            <p class="text-muted">Configure your connections and start a migration to begin.</p>
+                        </div>
+                    }
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Validation Report Section -->
+    @if (Report?.Validations?.Any() == true)
+    {
+        <div class="row mt-4">
+            <div class="col-12">
+                <ValidationReport Report="@Report" />
+            </div>
+        </div>
+    }
+
+    <!-- Error Modal -->
+    @if (!string.IsNullOrEmpty(_errorMessage))
+    {
+        <div class="modal show d-block" tabindex="-1" style="background: rgba(0,0,0,0.5);">
+            <div class="modal-dialog">
+                <div class="modal-content">
+                    <div class="modal-header bg-danger text-white">
+                        <h5 class="modal-title">
+                            <i class="oi oi-warning"></i> Error
+                        </h5>
+                        <button type="button" class="btn-close btn-close-white" @onclick="ClearError"></button>
+                    </div>
+                    <div class="modal-body">
+                        <p>@_errorMessage</p>
+                    </div>
+                    <div class="modal-footer">
+                        <button type="button" class="btn btn-secondary" @onclick="ClearError">Close</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    }
+</div>
+
+@code {
+    // Parameters
+    [Parameter] public string? MigrationId { get; set; }
+
+    // Private fields
+    private MigrationRequestDto request = new();
+    private HubConnection? _hubConnection;
+    private bool _isConnected;
+    private string? _activeMigrationId;
+    private MigrationReport? Report { get; set; }
+    private List<TableProgressDto> TableProgress { get; set; } = new();
+    private string StateFilePath => Path.Combine(Directory.GetCurrentDirectory(), "migration-state", "last-state.json");
+    private bool IsRunning { get; set; }
+    private ElementReference logContainer;
+    
+    // Additional properties
+    private string includeTablesText = string.Empty;
+    private string excludeTablesText = string.Empty;
+    private string? _errorMessage;
+    private List<LogEntry> _logs = new();
+    private DateTime _startTime;
+    private Timer? _etaTimer;
+    private readonly Queue<SpeedSample> _speedSamples = new();
+    
+    // Computed properties
+    private long TotalProcessedRows => TableProgress.Sum(t => t.RowsProcessed);
+    private long TotalRows => TableProgress.Sum(t => t.TotalRows);
+    private int CompletedTables => TableProgress.Count(t => t.Status == "Completed");
+    
+    private double CurrentSpeed
+    {
+        get
+        {
+            if (_speedSamples.Count < 2) return 0;
+            return Math.Round(_speedSamples.Average(s => s.RowsPerSecond), 0);
+        }
+    }
+
+    // Lifecycle methods
+    protected override async Task OnInitializedAsync()
+    {
+        // Load connection strings from configuration
+        request.SourceConnection = Configuration.GetConnectionString("SqlServer") ?? "";
+        request.TargetConnection = Configuration.GetConnectionString("Postgres") ?? "";
+        
+        // If MigrationId provided, load existing migration
+        if (!string.IsNullOrEmpty(MigrationId))
+        {
+            await LoadExistingMigration(MigrationId);
+        }
+        
+        // Subscribe to service events
+        MigrationService.TableProgressUpdated += OnTableProgressUpdated;
+        MigrationService.MigrationCompleted += OnMigrationCompleted;
+        
+        // Initialize SignalR
+        await InitializeSignalR();
+        
+        // Start ETA timer
+        _etaTimer = new Timer(_ => InvokeAsync(StateHasChanged), null, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1));
+        
+        AddLog("Migration dashboard initialized", "info");
+    }
+
+    private async Task InitializeSignalR()
+    {
+        try
+        {
+            _hubConnection = new HubConnectionBuilder()
+                .WithUrl(Navigation.ToAbsoluteUri("/migrationHub"))
+                .WithAutomaticReconnect(new[] 
+                { 
+                    TimeSpan.Zero, 
+                    TimeSpan.FromSeconds(2), 
+                    TimeSpan.FromSeconds(5), 
+                    TimeSpan.FromSeconds(10) 
+                })
+                .Build();
+
+            _hubConnection.On<TableProgressDto>("TableProgressUpdated", (progress) =>
+            {
+                UpdateTableProgress(progress);
+                UpdateSpeedMetrics();
+                AddLog($"Table {progress.TableName}: {progress.RowsProcessed:N0}/{progress.TotalRows:N0} rows", "debug");
+                StateHasChanged();
+            });
+
+            _hubConnection.On<MigrationCompletedEventArgs>("MigrationCompleted", async (completed) =>
+            {
+                AddLog($"Migration completed: {(completed.Success ? "Success" : "Failed")}", 
+                       completed.Success ? "success" : "error");
+                
+                if (completed.Report != null)
+                {
+                    Report = completed.Report;
+                    await LoadReportFromService();
+                }
+                
+                IsRunning = false;
+                StateHasChanged();
+            });
+
+            _hubConnection.On<string>("MigrationCancelled", (migrationId) =>
+            {
+                AddLog("Migration cancelled by user", "warning");
+                IsRunning = false;
+                StateHasChanged();
+            });
+
+            _hubConnection.Closed += async (error) =>
+            {
+                _isConnected = false;
+                AddLog($"SignalR connection closed: {error?.Message}", "warning");
+                await InvokeAsync(StateHasChanged);
+                
+                // Try to reconnect
+                await Task.Delay(5000);
+                await InitializeSignalR();
+            };
+
+            _hubConnection.Reconnecting += (error) =>
+            {
+                _isConnected = false;
+                AddLog("Attempting to reconnect...", "warning");
+                return Task.CompletedTask;
+            };
+
+            _hubConnection.Reconnected += (connectionId) =>
+            {
+                _isConnected = true;
+                AddLog("Reconnected to server", "success");
+                return Task.CompletedTask;
+            };
+
+            await _hubConnection.StartAsync();
+            _isConnected = true;
+            AddLog("Connected to real-time updates", "success");
+            
+            // Subscribe to migration if active
+            if (!string.IsNullOrEmpty(_activeMigrationId))
+            {
+                await _hubConnection.SendAsync("SubscribeToMigration", _activeMigrationId);
+            }
+        }
+        catch (Exception ex)
+        {
+            _isConnected = false;
+            AddLog($"Failed to connect to real-time updates: {ex.Message}", "error");
+        }
+    }
+
+    private async Task LoadExistingMigration(string migrationId)
+    {
+        try
+        {
+            _activeMigrationId = migrationId;
+            
+            // Load from state service
+            Report = await StateService.LoadMigrationStateAsync(migrationId);
+            
+            // Load current progress
+            var progress = await MigrationService.GetTableProgressAsync(migrationId);
+            TableProgress = progress.ToList();
+            
+            // Get status
+            var status = await MigrationService.GetMigrationStatusAsync(migrationId);
+            IsRunning = status.Status == "Running" || status.Status == "Starting";
+            
+            AddLog($"Loaded existing migration: {migrationId}", "info");
+            
+            // Subscribe to updates
+            if (_isConnected && _hubConnection != null)
+            {
+                await _hubConnection.SendAsync("SubscribeToMigration", migrationId);
+            }
+        }
+        catch (Exception ex)
+        {
+            AddLog($"Failed to load existing migration: {ex.Message}", "error");
+        }
+    }
+
+    private async Task LoadLastState()
+    {
+        try
+        {
+            if (File.Exists(StateFilePath))
+            {
+                var json = await File.ReadAllTextAsync(StateFilePath);
+                Report = JsonSerializer.Deserialize<MigrationReport>(json);
+                
+                if (Report != null)
+                {
+                    AddLog("Loaded last migration state", "success");
+                    
+                    // Try to load progress from service if migration is still active
+                    if (Report.Status == "In Progress")
+                    {
+                        var migrations = await MigrationService.GetAllActiveMigrationsAsync();
+                        var activeMigration = migrations.FirstOrDefault();
+                        if (activeMigration != null)
+                        {
+                            _activeMigrationId = activeMigration;
+                            await LoadExistingMigration(activeMigration);
+                        }
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            AddLog($"Failed to load last state: {ex.Message}", "error");
+        }
+    }
+
+    private async Task StartMigration()
+    {
+        try
+        {
+            IsRunning = true;
+            _startTime = DateTime.UtcNow;
+            TableProgress.Clear();
+            _speedSamples.Clear();
+            
+            // Parse table filters
+            if (!string.IsNullOrWhiteSpace(includeTablesText))
+            {
+                request.IncludeTables = includeTablesText.Split(',', StringSplitOptions.RemoveEmptyEntries)
+                    .Select(t => t.Trim())
+                    .ToList();
+            }
+            
+            if (!string.IsNullOrWhiteSpace(excludeTablesText))
+            {
+                request.ExcludeTables = excludeTablesText.Split(',', StringSplitOptions.RemoveEmptyEntries)
+                    .Select(t => t.Trim())
+                    .ToList();
+            }
+            
+            AddLog($"Starting migration with {request.MaxParallelTables} parallel tables", "info");
+            
+            // Start migration through service
+            _activeMigrationId = await MigrationService.StartMigrationAsync(request);
+            
+            // Navigate to migration-specific URL
+            Navigation.NavigateTo($"/migration/{_activeMigrationId}");
+            
+            // Subscribe to updates
+            if (_isConnected && _hubConnection != null)
+            {
+                await _hubConnection.SendAsync("SubscribeToMigration", _activeMigrationId);
+            }
+            
+            AddLog($"Migration started with ID: {_activeMigrationId}", "success");
+        }
+        catch (Exception ex)
+        {
+            IsRunning = false;
+            _errorMessage = ex.Message;
+            AddLog($"Failed to start migration: {ex.Message}", "error");
+        }
+    }
+
+    private async Task CancelCurrentMigration()
+    {
+        try
+        {
+            if (!string.IsNullOrEmpty(_activeMigrationId))
+            {
+                AddLog("Cancelling migration...", "warning");
+                await MigrationService.CancelMigrationAsync(_activeMigrationId);
+            }
+        }
+        catch (Exception ex)
+        {
+            AddLog($"Failed to cancel migration: {ex.Message}", "error");
+        }
+    }
+
+    private async Task RefreshData()
+    {
+        if (!string.IsNullOrEmpty(_activeMigrationId))
+        {
+            await LoadExistingMigration(_activeMigrationId);
+        }
+    }
+
+    private async Task LoadReportFromService()
+    {
+        if (!string.IsNullOrEmpty(_activeMigrationId))
+        {
+            Report = await MigrationService.GetMigrationReportAsync(_activeMigrationId);
+        }
+    }
+
+    private void OnTableProgressUpdated(object? sender, TableProgressDto progress)
+    {
+        UpdateTableProgress(progress);
+        UpdateSpeedMetrics();
+        InvokeAsync(StateHasChanged);
+    }
+
+    private void OnMigrationCompleted(object? sender, MigrationCompletedEventArgs e)
+    {
+        IsRunning = false;
+        Report = e.Report;
+        AddLog($"Migration completed: {(e.Success ? "✓ Success" : "✗ Failed")}", 
+               e.Success ? "success" : "error");
+        InvokeAsync(StateHasChanged);
+    }
+
+    private void UpdateTableProgress(TableProgressDto progress)
+    {
+        var existing = TableProgress.FirstOrDefault(p => p.TableName == progress.TableName);
+        if (existing != null)
+        {
+            existing.RowsProcessed = progress.RowsProcessed;
+            existing.Status = progress.Status;
+            existing.Percentage = progress.Percentage;
+            existing.LastUpdated = DateTime.UtcNow;
+        }
+        else
+        {
+            TableProgress.Add(progress);
+        }
+    }
+
+    private void UpdateSpeedMetrics()
+    {
+        var currentTotal = TotalProcessedRows;
+        var now = DateTime.UtcNow;
+        
+        _speedSamples.Enqueue(new SpeedSample 
+        { 
+            RowsPerSecond = currentTotal - (_speedSamples.LastOrDefault()?.RowsProcessed ?? currentTotal),
+            Timestamp = now,
+            RowsProcessed = currentTotal
+        });
+        
+        // Keep last 10 samples
+        while (_speedSamples.Count > 10)
+        {
+            _speedSamples.Dequeue();
+        }
+    }
+
+    // Helper methods
+    private double GetOverallProgress()
+    {
+        if (TotalRows == 0) return 0;
+        return Math.Round(TotalProcessedRows * 100.0 / TotalRows, 1);
+    }
+
+    private string GetOverallProgressClass()
+    {
+        var progress = GetOverallProgress();
+        if (progress >= 100) return "bg-success";
+        if (progress >= 66) return "bg-info";
+        if (progress >= 33) return "bg-warning";
+        return "bg-danger";
+    }
+
+    private string GetStatusBadgeClass(string status) => status.ToLower() switch
+    {
+        "completed" => "bg-success",
+        "failed" => "bg-danger",
+        "starting" => "bg-info",
+        "cancelled" => "bg-secondary",
+        var s when s.StartsWith("retry") => "bg-warning",
+        _ => "bg-primary"
+    };
+
+    private string GetProgressBarClass(string status) => status.ToLower() switch
+    {
+        "completed" => "bg-success",
+        "failed" => "bg-danger",
+        "starting" => "bg-info",
+        var s when s.StartsWith("retry") => "bg-warning",
+        _ => "bg-primary"
+    };
+
+    private string CalculateTableETA(TableProgressDto progress)
+    {
+        if (progress.Status == "Completed") return "Done";
+        if (progress.Status == "Failed") return "Failed";
+        if (progress.RowsProcessed == 0 || CurrentSpeed == 0) return "--:--";
+        
+        var remainingRows = progress.TotalRows - progress.RowsProcessed;
+        var secondsRemaining = remainingRows / CurrentSpeed;
+        
+        if (secondsRemaining < 60) return "< 1 min";
+        if (secondsRemaining < 3600)
+        {
+            var _minutes = Math.Ceiling(secondsRemaining / 60);
+            return $"{_minutes} min";
+        }
+        
+        var hours = Math.Floor(secondsRemaining / 3600);
+        var minutes = Math.Ceiling((secondsRemaining % 3600) / 60);
+        return $"{hours}h {minutes}m";
+    }
+
+    private void AddLog(string message, string level = "info")
+    {
+        _logs.Add(new LogEntry
+        {
+            Timestamp = DateTime.Now,
+            Message = message,
+            Level = level
+        });
+
+        // Keep last 100 logs
+        if (_logs.Count > 100)
+        {
+            _logs.RemoveAt(0);
+        }
+
+        // Auto-scroll to bottom
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(100);
+            await logContainer.FocusAsync();
+        });
+    }
+
+    private void ClearLog()
+    {
+        _logs.Clear();
+        AddLog("Log cleared", "info");
+    }
+
+    private void ShowError(TableProgressDto progress)
+    {
+        _errorMessage = $"Table '{progress.TableName}' failed during migration. Check the logs for details.";
+    }
+
+    private void ClearError()
+    {
+        _errorMessage = null;
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        _etaTimer?.Dispose();
+        
+        if (_hubConnection != null)
+        {
+            if (!string.IsNullOrEmpty(_activeMigrationId))
+            {
+                await _hubConnection.SendAsync("UnsubscribeFromMigration", _activeMigrationId);
+            }
+            await _hubConnection.DisposeAsync();
+        }
+        
+        MigrationService.TableProgressUpdated -= OnTableProgressUpdated;
+        MigrationService.MigrationCompleted -= OnMigrationCompleted;
+    }
+
+    // Nested classes
+    private class SpeedSample
+    {
+        public double RowsPerSecond { get; set; }
+        public DateTime Timestamp { get; set; }
+        public long RowsProcessed { get; set; }
+    }
+
+    private class LogEntry
+    {
+        public DateTime Timestamp { get; set; }
+        public string Message { get; set; } = string.Empty;
+        public string Level { get; set; } = "info";
+    }
+}

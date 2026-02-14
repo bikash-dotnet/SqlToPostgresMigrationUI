@@ -1,0 +1,410 @@
+﻿@* Components/ValidationReport.razor *@
+@using SqlToPostgresMigrationUI.Core.Orchestrator
+@using System.Text
+@using SqlToPostgresMigrationUI.Core.Models
+@using Microsoft.JSInterop
+
+@inject IJSRuntime JS
+
+<div class="validation-report-container">
+    @if (Report?.Validations?.Any() == true)
+    {
+        <div class="row">
+            <div class="col-12">
+                <div class="card">
+                    <div class="card-header d-flex justify-content-between align-items-center">
+                        <h5 class="mb-0">Migration Validation Report</h5>
+                        <div>
+                            <button class="btn btn-sm btn-outline-primary me-2" @onclick="ExportToCsv">
+                                <i class="oi oi-data-transfer-download"></i> Export CSV
+                            </button>
+                            <button class="btn btn-sm btn-outline-secondary" @onclick="PrintReport">
+                                <i class="oi oi-print"></i> Print
+                            </button>
+                        </div>
+                    </div>
+                    <div class="card-body">
+                        <!-- Summary Stats -->
+                        <div class="row mb-4">
+                            <div class="col-md-3">
+                                <div class="card @(OverallSuccess ? "bg-success" : "bg-danger") text-white">
+                                    <div class="card-body text-center">
+                                        <h3>@OverallSuccessRate.ToString("F1")%</h3>
+                                        <small>Success Rate</small>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="col-md-3">
+                                <div class="card bg-info text-white">
+                                    <div class="card-body text-center">
+                                        <h3>@Report.Validations.Count</h3>
+                                        <small>Tables Validated</small>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="col-md-3">
+                                <div class="card bg-success text-white">
+                                    <div class="card-body text-center">
+                                        <h3>@Report.TablesValidated</h3>
+                                        <small>Valid Tables</small>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="col-md-3">
+                                <div class="card bg-warning text-white">
+                                    <div class="card-body text-center">
+                                        <h3>@Report.TablesFailedValidation</h3>
+                                        <small>Failed Tables</small>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Validation Tabs -->
+                        <ul class="nav nav-tabs mb-3" role="tablist">
+                            <li class="nav-item">
+                                <a class="nav-link @(activeTab == "all" ? "active" : "")"
+                                   @onclick='() => SetActiveTab("all")'
+                                   href="javascript:void(0)">
+                                    All Tables
+                                </a>
+                            </li>
+                            <li class="nav-item">
+                                <a class="nav-link @(activeTab == "valid" ? "active" : "")"
+                                   @onclick='() => SetActiveTab("valid")'
+                                   href="javascript:void(0)">
+                                    Valid Only
+                                </a>
+                            </li>
+                            <li class="nav-item">
+                                <a class="nav-link @(activeTab == "invalid" ? "active" : "")"
+                                   @onclick='() => SetActiveTab("invalid")'
+                                   href="javascript:void(0)">
+                                    Issues Found
+                                </a>
+                            </li>
+                        </ul>
+
+                        <!-- Validation Table -->
+                        <div class="table-responsive">
+                            <table class="table table-hover table-striped">
+                                <thead>
+                                    <tr>
+                                        <th>Table Name</th>
+                                        <th class="text-end">Source Rows</th>
+                                        <th class="text-end">Target Rows</th>
+                                        <th class="text-center">Difference</th>
+                                        <th class="text-center">Checksum Match</th>
+                                        <th class="text-center">Status</th>
+                                        <th class="text-center">Details</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    @foreach (var validation in FilteredValidations)
+                                    {
+                                        var rowDiff = validation.TargetRowCount - validation.SourceRowCount;
+                                        var checksumMatch = validation.SourceChecksum == validation.TargetChecksum;
+
+                                        <tr class="@(validation.IsValid ? "" : "table-danger")">
+                                            <td>
+                                                <strong>@validation.TableName</strong>
+                                            </td>
+                                            <td class="text-end">
+                                                @validation.SourceRowCount.ToString("N0")
+                                            </td>
+                                            <td class="text-end">
+                                                @validation.TargetRowCount.ToString("N0")
+                                            </td>
+                                            <td class="text-center">
+                                                @if (rowDiff != 0)
+                                                {
+                                                    <span class="badge bg-warning">
+                                                        @(rowDiff > 0 ? "+" : "")@rowDiff.ToString("N0")
+                                                    </span>
+                                                }
+                                                else
+                                                {
+                                                    <span class="badge bg-success">0</span>
+                                                }
+                                            </td>
+                                            <td class="text-center">
+                                                @if (checksumMatch)
+                                                {
+                                                    <span class="badge bg-success">✓ Match</span>
+                                                }
+                                                else
+                                                {
+                                                    <span class="badge bg-danger">✗ Mismatch</span>
+                                                }
+                                            </td>
+                                            <td class="text-center">
+                                                @if (validation.IsValid)
+                                                {
+                                                    <span class="badge bg-success">Valid</span>
+                                                }
+                                                else
+                                                {
+                                                    <span class="badge bg-danger">Invalid</span>
+                                                }
+                                            </td>
+                                            <td class="text-center">
+                                                <button class="btn btn-sm btn-outline-info"
+                                                        @onclick="() => ShowDetails(validation)">
+                                                    View Details
+                                                </button>
+                                            </td>
+                                        </tr>
+                                    }
+                                </tbody>
+                                <tfoot>
+                                    <tr class="table-secondary">
+                                        <td><strong>Totals</strong></td>
+                                        <td class="text-end">
+                                            <strong>@FilteredValidations.Sum(v => v.SourceRowCount).ToString("N0")</strong>
+                                        </td>
+                                        <td class="text-end">
+                                            <strong>@FilteredValidations.Sum(v => v.TargetRowCount).ToString("N0")</strong>
+                                        </td>
+                                        <td class="text-center">
+                                            @{
+                                                var totalDiff = FilteredValidations.Sum(v => v.TargetRowCount - v.SourceRowCount);
+                                            }
+                                            @if (totalDiff != 0)
+                                            {
+                                                <span class="badge bg-warning">
+                                                    @(totalDiff > 0 ? "+" : "")@totalDiff.ToString("N0")
+                                                </span>
+                                            }
+                                            else
+                                            {
+                                                <span class="badge bg-success">0</span>
+                                            }
+                                        </td>
+                                        <td colspan="3"></td>
+                                    </tr>
+                                </tfoot>
+                            </table>
+                        </div>
+
+                        <!-- Validation Details Modal -->
+                        @if (showDetailsModal && selectedValidation != null)
+                        {
+                            <div class="modal show d-block" tabindex="-1" style="background: rgba(0,0,0,0.5);">
+                                <div class="modal-dialog modal-lg">
+                                    <div class="modal-content">
+                                        <div class="modal-header">
+                                            <h5 class="modal-title">Validation Details: @selectedValidation.TableName</h5>
+                                            <button type="button" class="btn-close" @onclick="CloseModal"></button>
+                                        </div>
+                                        <div class="modal-body">
+                                            <table class="table table-sm">
+                                                <tr>
+                                                    <th style="width: 200px;">Validation Status:</th>
+                                                    <td>
+                                                        @if (selectedValidation.IsValid)
+                                                        {
+                                                            <span class="badge bg-success">PASSED</span>
+                                                        }
+                                                        else
+                                                        {
+                                                            <span class="badge bg-danger">FAILED</span>
+                                                        }
+                                                    </td>
+                                                </tr>
+                                                <tr>
+                                                    <th>Source Row Count:</th>
+                                                    <td>@selectedValidation.SourceRowCount.ToString("N0")</td>
+                                                </tr>
+                                                <tr>
+                                                    <th>Target Row Count:</th>
+                                                    <td>@selectedValidation.TargetRowCount.ToString("N0")</td>
+                                                </tr>
+                                                <tr>
+                                                    <th>Row Difference:</th>
+                                                    <td>
+                                                        @{
+                                                            var diff = selectedValidation.TargetRowCount - selectedValidation.SourceRowCount;
+                                                        }
+                                                        @if (diff != 0)
+                                                        {
+                                                            <span class="text-warning">@diff.ToString("N0") rows @(diff > 0 ? "extra" : "missing")</span>
+                                                        }
+                                                        else
+                                                        {
+                                                            <span class="text-success">No difference</span>
+                                                        }
+                                                    </td>
+                                                </tr>
+                                                <tr>
+                                                    <th>Source Checksum:</th>
+                                                    <td><code>@selectedValidation.SourceChecksum</code></td>
+                                                </tr>
+                                                <tr>
+                                                    <th>Target Checksum:</th>
+                                                    <td><code>@selectedValidation.TargetChecksum</code></td>
+                                                </tr>
+                                                <tr>
+                                                    <th>Checksum Match:</th>
+                                                    <td>
+                                                        @if (selectedValidation.SourceChecksum == selectedValidation.TargetChecksum)
+                                                        {
+                                                            <span class="text-success">✓ Match</span>
+                                                        }
+                                                        else
+                                                        {
+                                                            <span class="text-danger">✗ Mismatch</span>
+                                                        }
+                                                    </td>
+                                                </tr>
+                                            </table>
+
+                                            @if (!selectedValidation.IsValid)
+                                            {
+                                                <div class="alert alert-warning mt-3">
+                                                    <h6>Potential Issues:</h6>
+                                                    <ul class="mb-0">
+                                                        @if (selectedValidation.SourceRowCount != selectedValidation.TargetRowCount)
+                                                        {
+                                                            <li>Row count mismatch - Data may be incomplete or duplicated</li>
+                                                        }
+                                                        @if (selectedValidation.SourceChecksum != selectedValidation.TargetChecksum)
+                                                        {
+                                                            <li>Checksum mismatch - Data content may differ</li>
+                                                        }
+                                                    </ul>
+                                                </div>
+                                            }
+                                        </div>
+                                        <div class="modal-footer">
+                                            <button type="button" class="btn btn-secondary" @onclick="CloseModal">Close</button>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        }
+
+                        <!-- Recommendations -->
+                        @if (Report.TablesFailedValidation > 0)
+                        {
+                            <div class="alert alert-warning mt-3">
+                                <h6>⚠️ Validation Issues Detected</h6>
+                                <p>@Report.TablesFailedValidation table(s) failed validation. Recommendations:</p>
+                                <ul>
+                                    @if (FilteredInvalidValidations.Any(v => v.SourceRowCount != v.TargetRowCount))
+                                    {
+                                        <li>Check for incomplete data transfer or duplicate records</li>
+                                    }
+                                    @if (FilteredInvalidValidations.Any(v => v.SourceChecksum != v.TargetChecksum))
+                                    {
+                                        <li>Verify data type conversions didn't alter values</li>
+                                        <li>Check for NULL value handling differences</li>
+                                    }
+                                    <li>Consider re-migrating specific tables with issues</li>
+                                    <li>Review data transformation rules if any were applied</li>
+                                </ul>
+                            </div>
+                        }
+                        else
+                        {
+                            <div class="alert alert-success mt-3">
+                                <h6>✅ All Validations Passed!</h6>
+                                <p class="mb-0">All @Report.Validations.Count tables have been successfully validated. The migration is complete and data integrity is verified.</p>
+                            </div>
+                        }
+                    </div>
+                </div>
+            </div>
+        </div>
+    }
+    else
+    {
+        <div class="alert alert-info">
+            No validation data available. Complete a migration with validation enabled to see the report.
+        </div>
+    }
+</div>
+
+@code {
+    [Parameter] public MigrationReport? Report { get; set; }
+
+    private string activeTab = "all";
+    private bool showDetailsModal;
+    private TableValidationResult? selectedValidation;
+
+    private List<TableValidationResult> FilteredValidations
+    {
+        get
+        {
+            if (Report?.Validations == null) return new List<TableValidationResult>();
+
+            return activeTab switch
+            {
+                "valid" => Report.Validations.Where(v => v.IsValid).ToList(),
+                "invalid" => Report.Validations.Where(v => !v.IsValid).ToList(),
+                _ => Report.Validations.ToList()
+            };
+        }
+    }
+
+    private List<TableValidationResult> FilteredInvalidValidations =>
+        Report?.Validations?.Where(v => !v.IsValid).ToList() ?? new();
+
+    private double OverallSuccessRate
+    {
+        get
+        {
+            if (Report?.Validations == null || !Report.Validations.Any()) return 0;
+            return Report.TablesValidated * 100.0 / Report.Validations.Count;
+        }
+    }
+
+    private bool OverallSuccess => OverallSuccessRate == 100;
+
+    private void SetActiveTab(string tab)
+    {
+        activeTab = tab;
+    }
+
+    private void ShowDetails(TableValidationResult validation)
+    {
+        selectedValidation = validation;
+        showDetailsModal = true;
+    }
+
+    private void CloseModal()
+    {
+        showDetailsModal = false;
+        selectedValidation = null;
+    }
+
+    private async Task ExportToCsv()
+    {
+        if (Report?.Validations == null) return;
+
+        var csv = new StringBuilder();
+
+        // Header
+        csv.AppendLine("Table Name,Source Rows,Target Rows,Difference,Checksum Match,Status");
+
+        // Data rows
+        foreach (var v in Report.Validations)
+        {
+            var diff = v.TargetRowCount - v.SourceRowCount;
+            var checksumMatch = v.SourceChecksum == v.TargetChecksum;
+
+            csv.AppendLine($"\"{v.TableName}\"," +
+                           $"{v.SourceRowCount},{v.TargetRowCount},{diff},{checksumMatch},{v.IsValid}");
+        }
+
+        // Download file
+        var bytes = Encoding.UTF8.GetBytes(csv.ToString());
+        await JS.InvokeVoidAsync("saveAsFile",
+            $"validation-report-{DateTime.Now:yyyyMMdd-HHmmss}.csv",
+            Convert.ToBase64String(bytes));
+    }
+
+    private async Task PrintReport()
+    {
+        await JS.InvokeVoidAsync("printValidationReport");
+    }
+}
