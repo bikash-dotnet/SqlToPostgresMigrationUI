@@ -189,22 +189,29 @@ public class MigrationHostedService : BackgroundService, IMigrationService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        // Background task to clean up old migrations
-        while (!stoppingToken.IsCancellationRequested)
+        try
         {
-            await Task.Delay(TimeSpan.FromMinutes(5), stoppingToken);
-
-            // Remove completed migrations older than 1 hour
-            var oldMigrations = _activeMigrations.Values
-                .Where(j => j.EndTime.HasValue &&
-                           (DateTime.UtcNow - j.EndTime.Value) > TimeSpan.FromHours(1))
-                .Select(j => j.Id)
-                .ToList();
-
-            foreach (var id in oldMigrations)
+            // Background task to clean up old migrations
+            while (!stoppingToken.IsCancellationRequested)
             {
-                _activeMigrations.TryRemove(id, out _);
+                await Task.Delay(TimeSpan.FromMinutes(5), stoppingToken);
+
+                // Remove completed migrations older than 1 hour
+                var oldMigrations = _activeMigrations.Values
+                    .Where(j => j.EndTime.HasValue &&
+                               (DateTime.UtcNow - j.EndTime.Value) > TimeSpan.FromHours(1))
+                    .Select(j => j.Id)
+                    .ToList();
+
+                foreach (var id in oldMigrations)
+                {
+                    _activeMigrations.TryRemove(id, out _);
+                }
             }
+        }
+        catch (OperationCanceledException)
+        {
+            // Expected on shutdown or service stop, swallow and exit gracefully.
         }
     }
 }

@@ -96,28 +96,37 @@ public class SqlServerReader : IDisposable
         command.Parameters.AddWithValue("@Schema", schema);
         command.Parameters.AddWithValue("@Table", table);
 
-        using var reader = await command.ExecuteReaderAsync(cancellationToken);
-
-        while (await reader.ReadAsync(cancellationToken))
+        try
         {
-            var column = new ColumnSchema
-            {
-                Name = reader.GetString(0),
-                SourceType = reader.GetString(1),
-                TargetType = MapSqlTypeToPostgres(reader.GetString(1)),
-                IsNullable = reader.GetString(2) == "YES",
-                MaxLength = reader.IsDBNull(3) ? null : reader.GetInt32(3),
-                Precision = reader.IsDBNull(4) ? null : reader.GetByte(4),
-                Scale = reader.IsDBNull(5) ? null : reader.GetInt32(5),
-                DefaultValue = reader.IsDBNull(6) ? null : reader.GetString(6),
-                IsIdentity = reader.IsDBNull(7) ? false : reader.GetInt32(7) == 1,
-                IdentitySeed = reader.IsDBNull(8) ? null : reader.GetString(8),
-                IdentityIncrement = reader.IsDBNull(9) ? null : reader.GetString(9),
-                OrdinalPosition = reader.GetInt32(10)
-            };
+            using var reader = await command.ExecuteReaderAsync(cancellationToken);
 
-            columns.Add(column);
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                var column = new ColumnSchema
+                {
+                    Name = reader.GetString(0),
+                    SourceType = reader.GetString(1),
+                    TargetType = MapSqlTypeToPostgres(reader.GetString(1)),
+                    IsNullable = reader.GetString(2) == "YES",
+                    MaxLength = reader.IsDBNull(3) ? null : reader.GetInt32(3),
+                    Precision = reader.IsDBNull(4) ? null : reader.GetByte(4),
+                    Scale = reader.IsDBNull(5) ? null : reader.GetInt32(5),
+                    DefaultValue = reader.IsDBNull(6) ? null : reader.GetString(6),
+                    IsIdentity = reader.IsDBNull(7) ? false : reader.GetInt32(7) == 1,
+                    IdentitySeed = reader.IsDBNull(8) ? null : reader.GetDecimal(8).ToString(),
+                    IdentityIncrement = reader.IsDBNull(9) ? null : reader.GetDecimal(9).ToString(),
+                    OrdinalPosition = reader.GetInt32(10)
+                };
+
+                columns.Add(column);
+            }
         }
+        catch(Exception ex)
+        {
+            _logger.LogDebug($"ReadColumnsAsync failed for {table}", ex);
+            throw;
+        }
+        
 
         return columns;
     }
@@ -271,12 +280,24 @@ public class SqlServerReader : IDisposable
         int batchSize = 10000,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        var sql = $"SELECT * FROM [{table.SourceSchema}].[{table.SourceName}]";
+        // Build explicit column list to ensure order matches schema
+        var columnNames = string.Join(", ", table.Columns.OrderBy(c => c.OrdinalPosition).Select(c => $"[{c.Name}]"));
+        var sql = $"SELECT {columnNames} FROM [{table.SourceSchema}].[{table.SourceName}]";
 
         using var command = new SqlCommand(sql, _connection);
         command.CommandTimeout = 300; // 5 minutes
 
         using var reader = await command.ExecuteReaderAsync(CommandBehavior.SequentialAccess, cancellationToken);
+
+        // Validate field count matches schema
+        if (reader.FieldCount != table.Columns.Count)
+        {
+            _logger.LogError(
+                "Column count mismatch for {Table}: Reader has {ReaderCount} fields but schema has {SchemaCount} columns",
+                table.SourceName, reader.FieldCount, table.Columns.Count);
+            throw new InvalidOperationException(
+                $"Column count mismatch: reader returned {reader.FieldCount} fields but schema has {table.Columns.Count} columns");
+        }
 
         var batch = new List<object[]>(batchSize);
 
@@ -302,7 +323,8 @@ public class SqlServerReader : IDisposable
     {
         var sql = $"SELECT COUNT(*) FROM [{schema}].[{table}]";
         using var command = new SqlCommand(sql, _connection);
-        return (long)await command.ExecuteScalarAsync(cancellationToken);
+        var result = await command.ExecuteScalarAsync(cancellationToken);
+        return Convert.ToInt64(result);
     }
 
     private async Task EnsureConnectionAsync(CancellationToken cancellationToken)

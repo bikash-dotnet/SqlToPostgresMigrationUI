@@ -1,6 +1,8 @@
 ﻿@* Components/ProgressChart.razor *@
 @using SqlToPostgresMigrationUI.Services.DTOs
 @using Microsoft.JSInterop
+@using System.Collections.Concurrent
+@using System.Threading
 
 @inject IJSRuntime JS
 @implements IDisposable
@@ -105,11 +107,10 @@
     [Parameter] public string ChartId { get; set; } = $"chart-{Guid.NewGuid():N}";
 
     private ElementReference _chartElement;
-    private IJSObjectReference? _chartModule;
     private Timer? _updateTimer;
-    private readonly Queue<SpeedSample> _speedSamples = new();
+    private readonly ConcurrentQueue<SpeedSample> _speedSamples = new();
     private long _lastProcessedTotal;
-    private DateTime _lastSampleTime = DateTime.UtcNow;
+    private long _lastSampleTimeTicks = DateTime.UtcNow.Ticks;
 
     // Computed properties
     private long TotalProcessedRows => TableProgress.Sum(t => t.RowsProcessed);
@@ -124,8 +125,11 @@
     {
         get
         {
-            if (_speedSamples.Count < 2) return 0;
-            return _speedSamples.Average(s => s.RowsPerSecond);
+            // Snapshot the concurrent queue for thread-safe enumeration without locking
+            var snapshot = _speedSamples.ToArray();
+
+            if (snapshot.Length < 2) return 0;
+            return snapshot.Average(s => s.RowsPerSecond);
         }
     }
 
@@ -154,10 +158,6 @@
     {
         if (firstRender)
         {
-            _chartModule = await JS.InvokeAsync<IJSObjectReference>(
-                "import",
-                "./js/chart-utils.js");
-
             await InitializeChart();
 
             // Update chart every 2 seconds
@@ -172,10 +172,10 @@
 
     private async Task InitializeChart()
     {
-        if (_chartModule != null && TableProgress.Any())
+        if (TableProgress.Any())
         {
             var chartData = PrepareChartData();
-            await _chartModule.InvokeVoidAsync("createProgressChart",
+            await JS.InvokeVoidAsync("chartUtils.createProgressChart",
                 _chartElement,
                 chartData.labels,
                 chartData.datasets);
@@ -184,10 +184,10 @@
 
     private async Task UpdateChart()
     {
-        if (_chartModule != null && TableProgress.Any())
+        if (TableProgress.Any())
         {
             var chartData = PrepareChartData();
-            await _chartModule.InvokeVoidAsync("updateProgressChart",
+            await JS.InvokeVoidAsync("chartUtils.updateProgressChart",
                 _chartElement,
                 chartData.datasets);
         }
@@ -217,11 +217,13 @@
     {
         var currentTotal = TotalProcessedRows;
         var now = DateTime.UtcNow;
-        var timeDiff = (now - _lastSampleTime).TotalSeconds;
+        var lastSampleTime = new DateTime(Interlocked.Read(ref _lastSampleTimeTicks));
+        var timeDiff = (now - lastSampleTime).TotalSeconds;
 
         if (timeDiff >= 1)
         {
-            var rowsPerSecond = (currentTotal - _lastProcessedTotal) / timeDiff;
+            var prevProcessed = Interlocked.Read(ref _lastProcessedTotal);
+            var rowsPerSecond = (currentTotal - prevProcessed) / timeDiff;
 
             _speedSamples.Enqueue(new SpeedSample
             {
@@ -232,11 +234,11 @@
             // Keep last 10 samples
             while (_speedSamples.Count > 10)
             {
-                _speedSamples.Dequeue();
+                _speedSamples.TryDequeue(out _);
             }
 
-            _lastProcessedTotal = currentTotal;
-            _lastSampleTime = now;
+            Interlocked.Exchange(ref _lastProcessedTotal, currentTotal);
+            Interlocked.Exchange(ref _lastSampleTimeTicks, now.Ticks);
         }
     }
 

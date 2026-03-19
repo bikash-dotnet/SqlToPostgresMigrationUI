@@ -482,6 +482,7 @@
     private List<LogEntry> _logs = new();
     private DateTime _startTime;
     private Timer? _etaTimer;
+    private readonly object _speedLock = new();
     private readonly Queue<SpeedSample> _speedSamples = new();
     
     // Computed properties
@@ -493,8 +494,14 @@
     {
         get
         {
-            if (_speedSamples.Count < 2) return 0;
-            return Math.Round(_speedSamples.Average(s => s.RowsPerSecond), 0);
+            SpeedSample[] snapshot;
+            lock (_speedLock)
+            {
+                snapshot = _speedSamples.ToArray();
+            }
+
+            if (snapshot.Length < 2) return 0;
+            return Math.Round(snapshot.Average(s => s.RowsPerSecond), 0);
         }
     }
 
@@ -541,10 +548,14 @@
 
             _hubConnection.On<TableProgressDto>("TableProgressUpdated", (progress) =>
             {
-                UpdateTableProgress(progress);
-                UpdateSpeedMetrics();
-                AddLog($"Table {progress.TableName}: {progress.RowsProcessed:N0}/{progress.TotalRows:N0} rows", "debug");
-                StateHasChanged();
+                // Marshal to the Blazor renderer thread to avoid concurrent state mutations
+                InvokeAsync(() =>
+                {
+                    UpdateTableProgress(progress);
+                    UpdateSpeedMetrics();
+                    AddLog($"Table {progress.TableName}: {progress.RowsProcessed:N0}/{progress.TotalRows:N0} rows", "debug");
+                    StateHasChanged();
+                });
             });
 
             _hubConnection.On<MigrationCompletedEventArgs>("MigrationCompleted", async (completed) =>
@@ -682,7 +693,10 @@
             IsRunning = true;
             _startTime = DateTime.UtcNow;
             TableProgress.Clear();
-            _speedSamples.Clear();
+            lock (_speedLock)
+            {
+                _speedSamples.Clear();
+            }
             
             // Parse table filters
             if (!string.IsNullOrWhiteSpace(includeTablesText))
@@ -757,9 +771,13 @@
 
     private void OnTableProgressUpdated(object? sender, TableProgressDto progress)
     {
-        UpdateTableProgress(progress);
-        UpdateSpeedMetrics();
-        InvokeAsync(StateHasChanged);
+        // Ensure updates happen on the Blazor renderer thread to avoid concurrent access
+        InvokeAsync(() =>
+        {
+            UpdateTableProgress(progress);
+            UpdateSpeedMetrics();
+            StateHasChanged();
+        });
     }
 
     private void OnMigrationCompleted(object? sender, MigrationCompletedEventArgs e)
@@ -791,18 +809,20 @@
     {
         var currentTotal = TotalProcessedRows;
         var now = DateTime.UtcNow;
-        
-        _speedSamples.Enqueue(new SpeedSample 
-        { 
-            RowsPerSecond = currentTotal - (_speedSamples.LastOrDefault()?.RowsProcessed ?? currentTotal),
-            Timestamp = now,
-            RowsProcessed = currentTotal
-        });
-        
-        // Keep last 10 samples
-        while (_speedSamples.Count > 10)
+        lock (_speedLock)
         {
-            _speedSamples.Dequeue();
+            _speedSamples.Enqueue(new SpeedSample
+            {
+                RowsPerSecond = currentTotal - (_speedSamples.LastOrDefault()?.RowsProcessed ?? currentTotal),
+                Timestamp = now,
+                RowsProcessed = currentTotal
+            });
+
+            // Keep last 10 samples
+            while (_speedSamples.Count > 10)
+            {
+                _speedSamples.Dequeue();
+            }
         }
     }
 

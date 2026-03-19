@@ -5,6 +5,7 @@ using System.Collections.Concurrent;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using Npgsql;
 
 namespace SqlToPostgresMigrationUI.Core.Orchestrator;
 
@@ -65,7 +66,20 @@ public class MigrationOrchestrator : IDisposable
 
             foreach (var table in tablesInOrder)
             {
-                await _targetWriter.CreateTableAsync(table, _options.DryRun, cancellationToken);
+                // Create tables WITHOUT foreign keys
+                var tableCopy = new TableSchema
+                {
+                    SourceSchema = table.SourceSchema,
+                    SourceName = table.SourceName,
+                    TargetSchema = table.TargetSchema,
+                    TargetName = table.TargetName,
+                    Columns = table.Columns,
+                    Indexes = table.Indexes,
+                    PrimaryKey = table.PrimaryKey,
+                    RowCount = table.RowCount
+                    // Do NOT include foreign keys here
+                };
+                await _targetWriter.CreateTableAsync(tableCopy, _options.DryRun, false, cancellationToken);
                 _tables[table.TargetName] = table;
 
                 if (!_options.DryRun)
@@ -107,7 +121,7 @@ public class MigrationOrchestrator : IDisposable
 
             await Task.WhenAll(migrationTasks);
 
-            // Step 5: Create foreign keys
+            // Step 5: Create foreign keys (after all data is loaded)
             _logger.LogInformation("Creating foreign keys...");
             await _targetWriter.CreateForeignKeysAsync(schema.ForeignKeys, false, cancellationToken);
             report.ForeignKeysCreated = schema.ForeignKeys.Count;
@@ -141,11 +155,12 @@ public class MigrationOrchestrator : IDisposable
 
         for (int attempt = 1; attempt <= maxRetries; attempt++)
         {
+            NpgsqlTransaction? transaction = null;
             try
             {
                 UpdateProgress(table.TargetName, 0, table.RowCount, "Starting");
 
-                await using var transaction = await _targetWriter.BeginTransactionAsync(cancellationToken);
+                transaction = await _targetWriter.BeginTransactionAsync(cancellationToken);
 
                 var rows = _sourceReader.StreamTableDataAsync(table, _options.BatchSize, cancellationToken);
                 var rowsInserted = await _targetWriter.BulkInsertAsync(table, rows, cancellationToken);
@@ -167,6 +182,38 @@ public class MigrationOrchestrator : IDisposable
             }
             catch (Exception ex) when (attempt < maxRetries)
             {
+                try
+                {
+                    if (transaction is not null)
+                    {
+                        await transaction.RollbackAsync(cancellationToken);
+                    }
+                }
+                catch (Exception rollbackEx)
+                {
+                    _logger.LogWarning(rollbackEx, "Failed to rollback transaction for {Table}", table.TargetName);
+                }
+                finally
+                {
+                    if (transaction is not null)
+                    {
+                        await transaction.DisposeAsync();
+                    }
+                }
+
+                // Check if this is a constraint violation - don't retry those
+                if (ex.Message.Contains("null value in column") || ex.Message.Contains("Data constraint violation"))
+                {
+                    _logger.LogError(ex, "Data constraint violation in table {Table}. This will not be retried.", table.TargetName);
+                    TableCompleted?.Invoke(this, new TableCompletedEventArgs
+                    {
+                        TableName = table.TargetName,
+                        Success = false,
+                        ErrorMessage = ex.Message
+                    });
+                    throw;
+                }
+
                 _logger.LogWarning(ex,
                     "Attempt {Attempt} failed for table {Table}. Retrying in {Delay}s...",
                     attempt, table.TargetName, retryDelay);
@@ -177,6 +224,25 @@ public class MigrationOrchestrator : IDisposable
             }
             catch (Exception ex)
             {
+                try
+                {
+                    if (transaction is not null)
+                    {
+                        await transaction.RollbackAsync(cancellationToken);
+                    }
+                }
+                catch (Exception rollbackEx)
+                {
+                    _logger.LogWarning(rollbackEx, "Failed to rollback transaction for {Table}", table.TargetName);
+                }
+                finally
+                {
+                    if (transaction is not null)
+                    {
+                        await transaction.DisposeAsync();
+                    }
+                }
+
                 _logger.LogError(ex, "Failed to migrate table {Table} after {Attempts} attempts",
                     table.TargetName, maxRetries);
 
@@ -199,9 +265,11 @@ public class MigrationOrchestrator : IDisposable
     {
         var validationTasks = new List<Task>();
         var validationResults = new ConcurrentBag<TableValidationResult>();
+        var semaphore = new SemaphoreSlim(4); // Limit to 4 concurrent validations
 
         foreach (var table in tables)
         {
+            await semaphore.WaitAsync(cancellationToken);
             validationTasks.Add(Task.Run(async () =>
             {
                 try
@@ -232,6 +300,10 @@ public class MigrationOrchestrator : IDisposable
                 catch (Exception ex)
                 {
                     _logger.LogError(ex, "Validation error for {Table}", table.TargetName);
+                }
+                finally
+                {
+                    semaphore.Release();
                 }
             }, cancellationToken));
         }
